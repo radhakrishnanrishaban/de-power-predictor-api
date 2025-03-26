@@ -5,6 +5,7 @@ import pytz
 from src.data.clients.entsoe_client import EntsoeClient
 from src.config import Config
 import requests
+
 @pytest.fixture
 def entsoe_client():
     """Create an EntsoeClient instance for testing"""
@@ -273,7 +274,7 @@ def test_get_load_data_series_handling(entsoe_client, mocker):
     index = pd.date_range(
         start=datetime.now(entsoe_client.tz),
         periods=24,
-        freq='H'
+        freq='h'
     )
     test_series = pd.Series(
         data=range(24),
