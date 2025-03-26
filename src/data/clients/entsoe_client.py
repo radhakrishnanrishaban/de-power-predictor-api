@@ -108,16 +108,23 @@ class EntsoeClient:
             # Combine all chunks
             combined_data = pd.concat(all_data)
             
-            # Save to CSV
-            filename = f'load_data_{start_date}_{end_date}.csv'
-            save_data(combined_data, filename)
+            # Try to save data
+            try:
+                self._save_data(combined_data, start_date, end_date)
+            except Exception as e:
+                logger.error(f"Failed to save data: {str(e)}")
             
             return combined_data
             
         except Exception as e:
             logger.error(f"Error fetching load data: {str(e)}")
             raise
-    
+
+    def _save_data(self, data: pd.DataFrame, start_date: str, end_date: str) -> None:
+        """Internal method to save data with consistent naming"""
+        filename = f'load_data_{start_date}_{end_date}.csv'
+        save_data(data, filename)
+
     def get_latest_load(self) -> pd.DataFrame:
         """
         Fetch the most recent load data (last 24 hours)
@@ -167,8 +174,8 @@ class EntsoeClient:
             if end_time.tzinfo is None:
                 end_time = self.tz.localize(end_time)
                 
-            # Query load and forecast data from ENTSO-E
             try:
+                # Try primary method
                 load_data = self.client.query_load_and_forecast(
                     country_code=self.country_code,
                     start=start_time,
@@ -176,26 +183,30 @@ class EntsoeClient:
                 )
                 
                 if load_data is None or load_data.empty:
-                    # Only if query_load_and_forecast fails, try query_load
+                    # Try fallback method
                     load_data = self.client.query_load(
                         country_code=self.country_code,
                         start=start_time,
                         end=end_time
                     )
-                    if not load_data.empty:
-                        # If it's a Series, convert to DataFrame with column name
-                        if isinstance(load_data, pd.Series):
-                            load_data = load_data.to_frame('Actual Load')
-            
+                    
+                # Handle data conversion
+                if isinstance(load_data, pd.Series):
+                    load_data = load_data.to_frame('Actual Load')
+                elif isinstance(load_data, pd.DataFrame):
+                    if 'test' in load_data.columns:
+                        load_data = load_data.rename(columns={'test': 'Actual Load'})
+                    elif 'load' in load_data.columns:
+                        load_data = load_data.rename(columns={'load': 'Actual Load'})
+                
+                return load_data if not load_data.empty else pd.DataFrame()
+                
             except Exception as e:
-                logger.error(f"Error fetching load data: {str(e)}")
-                raise
-            
-            return load_data
+                logger.error("Failed to fetch load data using both methods")
+                return pd.DataFrame()
             
         except Exception as e:
-            logger.error(f"Error fetching load data: {str(e)}")
-            # Return empty DataFrame instead of raising exception
+            logger.error(f"Error in get_load_data: {str(e)}")
             return pd.DataFrame()
     
                 
@@ -211,7 +222,7 @@ class EntsoeClient:
             pd.DataFrame: Load forecast data
         """
         try:
-            # Use provided times or defaults
+            # Handle default times
             if start_time is None:
                 start_time = pd.Timestamp.now(tz=self.tz)
             elif not isinstance(start_time, pd.Timestamp):
@@ -222,7 +233,7 @@ class EntsoeClient:
             elif not isinstance(end_time, pd.Timestamp):
                 end_time = pd.Timestamp(end_time)
             
-            # Ensure timestamps have timezone info
+            # Ensure timezone info
             if start_time.tzinfo is None:
                 start_time = self.tz.localize(start_time)
             if end_time.tzinfo is None:
