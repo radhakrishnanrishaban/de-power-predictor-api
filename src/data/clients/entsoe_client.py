@@ -12,7 +12,7 @@ from entsoe.exceptions import NoMatchingDataError
 from tqdm import tqdm
 
 from src.config import Config
-from src.data.utils import save_data
+from src.data.utils import storage
 
 logger = logging.getLogger(__name__)
 
@@ -33,64 +33,72 @@ class EntsoeClient:
         chunk_size: int = 30,
         max_retries: int = 3
     ) -> pd.DataFrame:
-        """
-        Fetch load data from ENTSO-E in chunks with retry logic
+        """Fetch load data from ENTSO-E in chunks with retry logic"""
+        # Validate dates before try-except block
+        start_date = start_date.strip()
+        end_date = end_date.strip()
         
-        Args:
-            start_date (str): Start date in format YYYYMMDD
-            end_date (str): End date in format YYYYMMDD
-            chunk_size (int): Number of days per request
-            max_retries (int): Maximum number of retry attempts
-        
-        Returns:
-            pd.DataFrame: Combined load data for the entire period
-        """
+        if not (start_date.isdigit() and len(start_date) == 8 and 
+                end_date.isdigit() and len(end_date) == 8):
+            raise ValueError("Dates must be in YYYYMMDD format")
+
         try:
-            # Clean input dates
-            start_date = start_date.strip()
-            end_date = end_date.strip()
+            # Cache check after validation
+            cache_key = f"load_data_{start_date}_{end_date}"
+            cached_data = storage.get_cached_data(cache_key)
+            if cached_data is not None:
+                logger.info("Using cached data")
+                return cached_data
             
-            # Validate date format
-            if not (len(start_date) == 8 and len(end_date) == 8):
-                raise ValueError("Dates must be in YYYYMMDD format")
+            start = pd.Timestamp(datetime.strptime(start_date, '%Y%m%d'), tz=self.tz)
+            end = pd.Timestamp(datetime.strptime(end_date, '%Y%m%d'), tz=self.tz)
             
-            start = self.tz.localize(datetime.strptime(start_date, '%Y%m%d'))
-            end = self.tz.localize(datetime.strptime(end_date, '%Y%m%d'))
-            
-            # Validate date range
             if end <= start:
                 raise ValueError("End date must be after start date")
             
-            # Calculate number of chunks
+            # Check if requesting future data
+            now = pd.Timestamp.now(tz=self.tz)
+            if start > now:
+                logger.info("Requesting future data, returning empty DataFrame")
+                return pd.DataFrame()
+            
             total_days = (end - start).days
             num_chunks = (total_days + chunk_size - 1) // chunk_size
             
             all_data = []
             current_start = start
             
-            # Create progress bar for chunks
             with tqdm(total=num_chunks, desc="Fetching Load Data") as pbar:
                 while current_start < end:
                     current_end = min(current_start + timedelta(days=chunk_size), end)
+                    chunk_success = False
                     
                     for attempt in range(max_retries):
                         try:
-                            logger.info(f"Fetching data from {current_start} to {current_end}")
+                            logger.debug(f"Attempt {attempt + 1} for chunk {current_start} to {current_end}")
                             chunk_data = self.client.query_load_and_forecast(
                                 country_code=self.country_code,
-                                start=pd.Timestamp(current_start),
-                                end=pd.Timestamp(current_end)
+                                start=current_start,
+                                end=current_end
                             )
                             
-                            if not chunk_data.empty:
+                            if isinstance(chunk_data, pd.DataFrame) and not chunk_data.empty:
+                                # Handle timezone-naive data
+                                if chunk_data.index.tz is None:
+                                    chunk_data.index = chunk_data.index.tz_localize('UTC').tz_convert(self.tz)
+                                elif chunk_data.index.tz != self.tz:
+                                    chunk_data.index = chunk_data.index.tz_convert(self.tz)
+                                
+                                # Ensure hourly frequency
+                                chunk_data = chunk_data.asfreq('h')
                                 all_data.append(chunk_data)
+                                chunk_success = True
                                 break
                                 
-                        except NoMatchingDataError:
-                            logger.warning(f"No data found between {current_start} and {current_end}")
-                            break
-                            
-                        except requests.ConnectionError as e:
+                        except (requests.ConnectionError, NoMatchingDataError) as e:
+                            if isinstance(e, NoMatchingDataError):
+                                logger.info(f"No data available for period {current_start} to {current_end}")
+                                break
                             if attempt == max_retries - 1:
                                 logger.error(f"Failed after {max_retries} attempts: {str(e)}")
                                 raise
@@ -98,19 +106,30 @@ class EntsoeClient:
                             logger.warning(f"Attempt {attempt + 1} failed, waiting {wait_time} seconds")
                             time.sleep(wait_time)
                     
+                    if not chunk_success:
+                        logger.warning(f"No data found between {current_start} and {current_end}")
+                    
                     current_start = current_end
                     pbar.update(1)
             
             if not all_data:
-                logger.error("No data was successfully fetched")
                 return pd.DataFrame()
             
-            # Combine all chunks
             combined_data = pd.concat(all_data)
             
-            # Try to save data
+            # Ensure no duplicates and proper sorting
+            combined_data = combined_data[~combined_data.index.duplicated(keep='first')]
+            combined_data = combined_data.sort_index()
+            
             try:
-                self._save_data(combined_data, start_date, end_date)
+                metadata = {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "source": "ENTSOE",
+                    "query_type": "load_data"
+                }
+                storage.save_raw_data(combined_data, f"load_data_{start_date}_{end_date}", metadata)
+                storage.cache_data(combined_data, cache_key, expire_hours=24)
             except Exception as e:
                 logger.error(f"Failed to save data: {str(e)}")
             
@@ -120,19 +139,10 @@ class EntsoeClient:
             logger.error(f"Error fetching load data: {str(e)}")
             raise
 
-    def _save_data(self, data: pd.DataFrame, start_date: str, end_date: str) -> None:
-        """Internal method to save data with consistent naming"""
-        filename = f'load_data_{start_date}_{end_date}.csv'
-        save_data(data, filename)
-
     def get_latest_load(self) -> pd.DataFrame:
-        """
-        Fetch the most recent load data (last 24 hours)
-        
-        Returns:
-            pd.DataFrame: Latest load data
-        """
+        """Fetch the most recent load data (last 24 hours)"""
         try:
+            # Temporarily disable cache for testing
             end = datetime.now(self.tz)
             start = end - timedelta(days=1)
             
@@ -141,6 +151,12 @@ class EntsoeClient:
                 start=pd.Timestamp(start),
                 end=pd.Timestamp(end)
             )
+            
+            if data is None or (isinstance(data, pd.DataFrame) and data.empty):
+                raise Exception("No data available")
+            
+            if isinstance(data, pd.Series):
+                data = data.to_frame('Actual Load')
             
             return data
             
@@ -211,16 +227,7 @@ class EntsoeClient:
     
                 
     def get_load_forecast(self, start_time=None, end_time=None) -> pd.DataFrame:
-        """
-        Fetch load forecast data for a specific time range
-        
-        Args:
-            start_time: Start time as datetime or pandas Timestamp (default: now)
-            end_time: End time as datetime or pandas Timestamp (default: now + 24 hours)
-            
-        Returns:
-            pd.DataFrame: Load forecast data
-        """
+        """Fetch load forecast data for a specific time range"""
         try:
             # Handle default times
             if start_time is None:
@@ -239,7 +246,6 @@ class EntsoeClient:
             if end_time.tzinfo is None:
                 end_time = self.tz.localize(end_time)
             
-            # Query load forecast from ENTSO-E
             try:
                 forecast_data = self.client.query_load_forecast(
                     country_code=self.country_code,
@@ -247,28 +253,29 @@ class EntsoeClient:
                     end=end_time
                 )
                 
-                if forecast_data is None or forecast_data.empty:
+                if forecast_data is None or (isinstance(forecast_data, pd.DataFrame) and forecast_data.empty):
                     logger.warning("No data from query_load_forecast, trying alternative method")
                     forecast_data = self.client.query_load(
                         country_code=self.country_code,
                         start=start_time,
                         end=end_time,
-                        process_type='A01'  # Day-ahead forecast
+                        process_type='A01'
                     )
             except Exception as e:
                 logger.warning(f"Error with ENTSOE API: {str(e)}")
                 # Generate synthetic forecast
-                date_range = pd.date_range(start=start_time, end=end_time, freq='15min')
-                base_load = 50000  # Base load in MW
+                date_range = pd.date_range(start=start_time, end=end_time, freq='h')
+                base_load = 50000
                 hours = np.array([dt.hour for dt in date_range])
-                day_effect = 10000 * np.sin(np.pi * (hours - 6) / 12)  # Daily pattern
+                day_effect = 10000 * np.sin(np.pi * (hours - 6) / 12)
                 forecast_values = base_load + day_effect
-                forecast_data = pd.Series(forecast_values, index=date_range)
-                logger.info(f"Generated synthetic forecast with {len(forecast_data)} points")
+                forecast_data = pd.DataFrame({'Load Forecast': forecast_values}, index=date_range)
+            
+            if isinstance(forecast_data, pd.Series):
+                forecast_data = forecast_data.to_frame('Load Forecast')
             
             return forecast_data
             
         except Exception as e:
             logger.error(f"Error fetching load forecast: {str(e)}")
-            # Return empty DataFrame instead of raising exception
             return pd.DataFrame()

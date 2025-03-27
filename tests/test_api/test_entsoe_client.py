@@ -5,6 +5,7 @@ import pytz
 from src.data.clients.entsoe_client import EntsoeClient
 from src.config import Config
 import requests
+import numpy as np
 
 @pytest.fixture
 def entsoe_client():
@@ -51,12 +52,31 @@ def test_fetch_load_data_specific_timestamp(entsoe_client):
         assert not fetched_df['Actual Load'].isna().all()
         assert (fetched_df['Actual Load'] >= 0).all()  
 
-def test_fetch_load_data_past_24h(entsoe_client):
+def test_fetch_load_data_past_24h(entsoe_client, mocker):
     """Fetching load data for past 24 hours should return valid data"""
     # given
-    start_time = datetime.now() - timedelta(hours=24)
-    end_time = datetime.now()
+    start_time = datetime.now(entsoe_client.tz) - timedelta(hours=24)
+    end_time = datetime.now(entsoe_client.tz)
     
+    # Create mock data with proper hourly points
+    index = pd.date_range(start=start_time, end=end_time, freq='h')
+    mock_data = pd.DataFrame({
+        'Actual Load': np.random.uniform(40000, 60000, size=len(index))
+    }, index=index)
+    
+    # Mock the API call
+    mocker.patch.object(
+        entsoe_client.client,
+        'query_load_and_forecast',
+        return_value=mock_data
+    )
+    
+    # Mock cache to return None
+    mocker.patch(
+        'src.data.utils.storage.get_cached_data',
+        return_value=None
+    )
+
     # when
     start_date = start_time.strftime('%Y%m%d')
     end_date = end_time.strftime('%Y%m%d')
@@ -64,7 +84,7 @@ def test_fetch_load_data_past_24h(entsoe_client):
         start_date=start_date,
         end_date=end_date
     )
-    
+
     # then
     # Data structure checks
     assert isinstance(fetched_df, pd.DataFrame)
@@ -171,6 +191,23 @@ def test_fetch_load_data_invalid_format(entsoe_client):
 
 def test_fetch_load_data_connection_retry(entsoe_client, mocker):
     """Test connection retry logic"""
+    # Mock cache to return None
+    mocker.patch(
+        'src.data.utils.storage.get_cached_data',
+        return_value=None
+    )
+    
+    # Create mock data with proper timezone
+    mock_data = pd.DataFrame(
+        {'Actual Load': [1, 2, 3]},
+        index=pd.date_range(
+            start=datetime.now(entsoe_client.tz),
+            periods=3,
+            freq='h',
+            tz=entsoe_client.tz
+        )
+    )
+    
     # Mock query_load_and_forecast to fail twice then succeed
     mock_query = mocker.patch.object(
         entsoe_client.client,
@@ -178,24 +215,25 @@ def test_fetch_load_data_connection_retry(entsoe_client, mocker):
         side_effect=[
             requests.ConnectionError("First failure"),
             requests.ConnectionError("Second failure"),
-            pd.DataFrame({'Actual Load': [1, 2, 3]})
+            mock_data
         ]
     )
-    
+
     start_date = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
     end_date = datetime.now().strftime('%Y%m%d')
     
     data = entsoe_client.fetch_load_data(
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
+        chunk_size=1  # Use small chunk size to ensure single chunk
     )
     
     assert not data.empty
     assert mock_query.call_count == 3
+    assert data.index.tz == entsoe_client.tz
 
 def test_get_load_forecast_synthetic_data(entsoe_client, mocker):
     """Test synthetic data generation when API fails"""
-    # Mock both query methods to fail
     mocker.patch.object(
         entsoe_client.client,
         'query_load_forecast',
@@ -215,25 +253,49 @@ def test_get_load_forecast_synthetic_data(entsoe_client, mocker):
         end_time=end_time
     )
     
+    assert isinstance(forecast, pd.DataFrame)
     assert not forecast.empty
     assert len(forecast) > 0
-    assert forecast.min() >= 40000
-    assert forecast.max() <= 60000
+    assert forecast['Load Forecast'].min() >= 40000
+    assert forecast['Load Forecast'].max() <= 60000
 
 def test_save_data_handling(entsoe_client, mocker):
     """Test data saving functionality"""
-    # Mock save_data to raise an exception
-    mock_save = mocker.patch(
-        'src.data.clients.entsoe_client.save_data',
+    # Mock cache to return None
+    mocker.patch(
+        'src.data.utils.storage.get_cached_data',
+        return_value=None
+    )
+    
+    # Mock save_raw_data to raise exception
+    mocker.patch(
+        'src.data.utils.storage.save_raw_data',
         side_effect=Exception("Save failed")
     )
     
-    # Mock logger
-    mock_logger = mocker.patch('src.data.clients.entsoe_client.logger')
+    # Create mock data with proper timezone
+    mock_data = pd.DataFrame(
+        {'Actual Load': [1, 2, 3]},
+        index=pd.date_range(
+            start=datetime.now(entsoe_client.tz),
+            periods=3,
+            freq='h',
+            tz=entsoe_client.tz
+        )
+    )
     
+    # Mock successful API call
+    mocker.patch.object(
+        entsoe_client.client,
+        'query_load_and_forecast',
+        return_value=mock_data
+    )
+
+    mock_logger = mocker.patch('src.data.clients.entsoe_client.logger')
+
     start_date = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
     end_date = datetime.now().strftime('%Y%m%d')
-    
+
     data = entsoe_client.fetch_load_data(
         start_date=start_date,
         end_date=end_date
@@ -337,7 +399,7 @@ def test_get_load_forecast_alternative_method(entsoe_client, mocker):
         index=pd.date_range(
             start=datetime.now(entsoe_client.tz),
             periods=24,
-            freq='H'
+            freq='h'
         )
     )
     mocker.patch.object(

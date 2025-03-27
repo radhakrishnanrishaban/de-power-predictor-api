@@ -1,3 +1,3 @@
-from .io import save_data
+from .io import storage
 
-__all__ = ['save_data']
+__all__ = ['storage']
