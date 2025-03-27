@@ -1,0 +1,36 @@
+Model trained on 3 years of data
+
+Overall Metrics:
+  mae: 1493.1019
+  rmse: 2053.1748
+  mape: 2.7989
+  r2: 0.9524
+
+Fold-wise MAPE:
+  Fold 1: 1.24%
+  Fold 2: 2.81%
+  Fold 3: 7.60%
+  Fold 4: 3.11%
+  Fold 5: 2.09%
+
+Sunday-Specific Metrics:
+  Mean Error: -72.78
+  Mean Absolute Error: 1797.99
+  Mean Percentage Error: 3.22%
+
+Top 15 Features by Importance:
+  1. hour: 23396372671498.3984
+  2. Actual Load: 17599394092878.3984
+  3. weekday_cos: 7702092850043.2002
+  4. weekday: 4413782864218.4004
+  5. is_day_before_holiday: 3097709826419.2002
+  6. rolling_mean_168h: 2602354673093.6001
+  7. hour_cos: 2093255142106.3999
+  8. 96_periods_ago_load: 1184948368845.6001
+  9. weekday_sin: 1036677625152.0000
+  10. hour_sin: 467174576045.6000
+  11. month: 359499880068.8000
+  12. rolling_std_24h: 310449394980.8000
+  13. rolling_mean_24h: 264405112942.4000
+  14. 672_periods_ago_load: 241598002591.2000
+  15. rolling_std_168h: 165450917512.0000
