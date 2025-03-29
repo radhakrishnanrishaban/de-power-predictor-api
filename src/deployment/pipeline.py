@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 import pytz
+import holidays
 
 from src.data.clients.entsoe_client import EntsoeClient
 from src.data.preprocess.preprocessor import LoadDataPreprocessor
@@ -20,79 +21,40 @@ class DataPipeline:
         self.feature_extractor = LoadFeatureExtractor()
         self.model = LoadPredictor()
         self.tz = pytz.timezone('Europe/Berlin')
-        self.historical_data = None
-        
-    def initialize_with_historical_data(self, days_or_data=7) -> bool:
-        """Initialize the pipeline with historical data.
-        
-        Args:
-            days_or_data: Either number of days to fetch or actual DataFrame to use
-        """
+        self.historical_data = None  # To store historical data for deployment
+    
+    def initialize_with_historical_data(self, historical_data: pd.DataFrame) -> bool:
+        """Initialize the pipeline with historical data for deployment."""
         try:
-            if isinstance(days_or_data, pd.DataFrame):
-                # Use provided data directly
-                raw_data = days_or_data
-            else:
-                # Fetch historical data for specified days
-                end_time = datetime.now(self.tz)
-                start_time = end_time - timedelta(days=days_or_data)
-                raw_data = self.entsoe_client.get_load_data(start_time, end_time)
-            
-            if raw_data.empty:
-                logger.error("No historical data available")
-                return False
-            
-            # Preprocess data
-            processed_data = self.preprocessor.preprocess(raw_data)
-            if processed_data is None or processed_data.empty:
-                logger.error("Failed to preprocess historical data")
-                return False
-            
-            # Store historical data
-            self.historical_data = processed_data
-            
-            # Initialize preprocessor with historical data
-            self.preprocessor.initialize_with_historical(processed_data)
-            
+            self.historical_data = historical_data
             return True
-            
         except Exception as e:
             logger.error(f"Error initializing with historical data: {str(e)}")
             return False
     
-    def process_new_data(self, current_time: Optional[datetime] = None) -> pd.DataFrame:
-        """Process new data for prediction."""
-        try:
-            if current_time is None:
-                current_time = datetime.now(self.tz)
-            
-            # For future timestamps, use historical data and forecast
-            if current_time > datetime.now(self.tz):
-                if self.historical_data is None:
-                    raise ValueError("No historical data available for future prediction")
-                return self.historical_data
-            
-            # Get latest data
-            start_time = current_time - timedelta(days=1)
-            raw_data = self.entsoe_client.get_load_data(start_time, current_time)
-            
-            if raw_data.empty:
-                raise ValueError("No new data available")
-            
-            # Preprocess data
-            processed_data = self.preprocessor.preprocess_live(raw_data)
-            if processed_data is None:
-                raise ValueError("Failed to preprocess new data")
-            
-            return processed_data
-            
-        except Exception as e:
-            logger.error(f"Error processing new data: {str(e)}")
-            raise
+    def get_historical_data(self) -> Optional[pd.DataFrame]:
+        """Return the historical data stored in the pipeline."""
+        return self.historical_data
     
-    def get_historical_data(self) -> pd.DataFrame:
-        """Get the historical data."""
-        return self.historical_data if self.historical_data is not None else pd.DataFrame()
+    def get_holidays(self, start_year: Optional[int] = None, end_year: Optional[int] = None) -> list:
+        """Fetch German holidays for the given year range."""
+        try:
+            # Default to the current year and the next year if not specified
+            if start_year is None:
+                start_year = datetime.now().year - 1
+            if end_year is None:
+                end_year = datetime.now().year + 1
+
+            # Initialize German holidays
+            de_holidays = holidays.Germany(years=range(start_year, end_year + 1))
+
+            # Convert holiday dates to a list of dates
+            holiday_dates = [date for date, _ in de_holidays.items()]
+            return holiday_dates
+        except Exception as e:
+            logger.error(f"Error fetching holidays: {str(e)}")
+            return []
+    
     
     def prepare_training_data(
         self,
@@ -101,6 +63,13 @@ class DataPipeline:
     ) -> Tuple[pd.DataFrame, pd.Series]:
         """Prepare data for training"""
         try:
+
+            # Validate date format
+            start = pd.to_datetime(start_date, errors='raise')
+            end = pd.to_datetime(end_date, errors='raise')
+            if start >= end:
+                raise ValueError("start_date must be before end_date")
+        
             # Fetch raw data
             raw_data = self.entsoe_client.fetch_load_data(start_date, end_date)
             if raw_data.empty:
@@ -166,10 +135,8 @@ class DataPipeline:
             # Preprocess data
             processed_data = self.preprocessor.preprocess(raw_data)
             
-            # Extract features - using extract_features instead of transform
-            features = self.feature_extractor.extract_features(processed_data)
-            if features is None:
-                raise ValueError("Failed to extract features")
+            # Extract features
+            features = self.feature_extractor.transform(processed_data)
             
             # Make prediction
             predictions = self.model.predict(features)

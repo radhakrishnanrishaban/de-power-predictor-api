@@ -313,55 +313,75 @@ class LoadDataPreprocessor:
             logger.error(f"Error updating statistics: {str(e)}")
     
     def preprocess_live(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Preprocess new live data, using historical statistics if available."""
+        """Preprocess new live data with improved handling of future timestamps."""
         try:
             logger.info("Starting preprocessing pipeline")
             logger.info(f"Input data shape: {df.shape}")
             
-            # Check if DataFrame is empty
             if df is None or df.empty:
-                logger.warning("Input DataFrame is empty, cannot preprocess")
+                logger.warning("Input DataFrame is empty")
                 return None
             
-            # Validate input DataFrame has required column before proceeding
             if 'Actual Load' not in df.columns:
                 logger.error("DataFrame must contain 'Actual Load' column")
                 raise ValueError("DataFrame must contain 'Actual Load' column")
             
-            # Check if we have enough data points
-            if len(df) < 3:
-                logger.warning(f"Only {len(df)} data points available, need at least 3 for frequency inference")
-                # If we have historical data, we can use its frequency
-                if self.historical_start is not None:
-                    logger.info("Using historical frequency information")
-                    # Ensure the index is a DatetimeIndex
-                    if not isinstance(df.index, pd.DatetimeIndex):
-                        df.index = pd.to_datetime(df.index)
-                    # Set the frequency explicitly
-                    df = df.asfreq(self.freq)
-                else:
-                    # Not enough data and no historical context
-                    logger.error("Not enough data points and no historical context")
-                    return None
+            # Create a copy to avoid modifying the original
+            df = df.copy()
             
-            # Basic preprocessing
-            df = self.preprocess(df)
+            # Prepare index and handle duplicates
+            df = self._prepare_index(df)
+            df = self._handle_duplicates(df)
             
-            # Update statistics with new data
-            if df is not None and not df.empty:
-                self._update_statistics(df)
+            # Identify the last valid timestamp
+            last_valid_time = df['Actual Load'].last_valid_index()
+            
+            if last_valid_time is not None:
+                # Handle historical data (up to last_valid_time)
+                historical_mask = df.index <= last_valid_time
+                historical_data = df[historical_mask].copy()
                 
-                # Update historical boundaries
-                if self.historical_end is not None:
-                    if df.index.min() <= self.historical_end:
-                        logger.warning("New data overlaps with historical data")
-                    self.historical_end = max(self.historical_end, df.index.max())
-                else:
-                    self.historical_start = df.index.min()
-                    self.historical_end = df.index.max()
+                # Apply full preprocessing to historical data
+                historical_data = self._validate_values(historical_data)
+                historical_data = self._handle_missing_values(historical_data)
+                historical_data = self._remove_outliers(historical_data)
+                
+                # Handle future data (after last_valid_time)
+                future_mask = df.index > last_valid_time
+                if future_mask.any():
+                    future_data = df[future_mask].copy()
+                    logger.info(f"Processing {len(future_data)} future timestamps")
+                    
+                    # For future data, we'll estimate values using patterns
+                    if len(historical_data) > 0:
+                        # Calculate patterns from historical data
+                        hourly_pattern = historical_data.groupby(historical_data.index.hour)['Actual Load'].mean()
+                        daily_pattern = historical_data.groupby(historical_data.index.dayofweek)['Actual Load'].mean()
+                        overall_mean = historical_data['Actual Load'].mean()
+                        
+                        # Estimate future values
+                        for idx in future_data.index:
+                            future_data.loc[idx, 'Actual Load'] = (
+                                hourly_pattern[idx.hour] * 0.5 +
+                                daily_pattern[idx.dayofweek] * 0.3 +
+                                overall_mean * 0.2
+                            )
+                    else:
+                        logger.warning("No historical data available for pattern estimation")
+                        future_data['Actual Load'] = df['Actual Load'].mean()
+                    
+                    # Combine historical and future data
+                    df = pd.concat([historical_data, future_data])
+            else:
+                # If no valid timestamp found, apply basic preprocessing
+                df = self._validate_values(df)
+                df = self._handle_missing_values(df)
+            
+            # Update statistics
+            self._update_statistics(df)
             
             return df
             
         except Exception as e:
             logger.error(f"Error preprocessing live data: {str(e)}")
-            raise  # Re-raise the exception instead of returning None 
+            raise 

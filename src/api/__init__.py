@@ -1,12 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.config import Config
-from src.api.routes import data_router, forecast_router
+from src.api.routes import forecast, data
 
 app = FastAPI(
-    title="German Energy Forecast API",
-    description="API for forecasting German energy consumption",
-    version="0.1.0"
+    title="German Power Load Predictor API",
+    description="API for predicting power load in Germany",
+    version="1.0.0"
 )
 
 # Add CORS middleware
@@ -18,9 +18,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers with prefixes
-app.include_router(data_router, prefix="/api/v1/data", tags=["data"])
-app.include_router(forecast_router, prefix="/api/v1/forecast", tags=["forecast"])
+# Include the routers with proper prefixes
+app.include_router(
+    forecast.router,
+    prefix="/api/v1",
+    tags=["forecast"]
+)
+
+app.include_router(
+    data.router,
+    prefix="/api/v1/data",
+    tags=["data"]
+)
 
 @app.get("/health")
 async def health_check():

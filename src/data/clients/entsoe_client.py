@@ -10,6 +10,7 @@ from pathlib import Path
 from entsoe import EntsoePandasClient
 from entsoe.exceptions import NoMatchingDataError
 from tqdm import tqdm
+import traceback
 
 from src.config import Config
 from src.data.utils import storage
@@ -24,6 +25,7 @@ class EntsoeClient:
         self.client = EntsoePandasClient(api_key=api_key)
         self.country_code = country_code
         self.tz = pytz.timezone(Config.TIMEZONE)
+        self.logger = logging.getLogger(__name__)
     
     
     def fetch_load_data(
@@ -164,65 +166,55 @@ class EntsoeClient:
             logger.error(f"Error fetching latest load data: {str(e)}")
             raise
 
-    def get_load_data(self, start_time, end_time) -> pd.DataFrame:
-        """
-        Fetch load data for a specific time range
-        
-        Args:
-            start_time: Start time as datetime or pandas Timestamp
-            end_time: End time as datetime or pandas Timestamp
-            
-        Returns:
-            pd.DataFrame: Load data for the specified time range
-        """
+    def get_load_data(self, start_time, end_time):
+        """Get load data with improved logging and data validation."""
         try:
-            logger.info(f"Fetching load data from {start_time} to {end_time}")
+            self.logger.info(f"Fetching load data from {start_time} to {end_time}")
             
-            # Convert to pandas Timestamp if needed
-            if not isinstance(start_time, pd.Timestamp):
-                start_time = pd.Timestamp(start_time)
-            if not isinstance(end_time, pd.Timestamp):
-                end_time = pd.Timestamp(end_time)
+            # Convert timestamps to YYYYMMDD format for fetch_load_data
+            start_date = start_time.strftime('%Y%m%d')
+            end_date = end_time.strftime('%Y%m%d')
             
-            # Ensure timestamps have timezone info
-            if start_time.tzinfo is None:
-                start_time = self.tz.localize(start_time)
-            if end_time.tzinfo is None:
-                end_time = self.tz.localize(end_time)
-                
-            try:
-                # Try primary method
-                load_data = self.client.query_load_and_forecast(
-                    country_code=self.country_code,
-                    start=start_time,
-                    end=end_time
-                )
-                
-                if load_data is None or load_data.empty:
-                    # Try fallback method
-                    load_data = self.client.query_load(
-                        country_code=self.country_code,
-                        start=start_time,
-                        end=end_time
-                    )
-                    
-                # Handle data conversion
-                if isinstance(load_data, pd.Series):
-                    load_data = load_data.to_frame('Actual Load')
-                elif isinstance(load_data, pd.DataFrame):
-                    if 'test' in load_data.columns:
-                        load_data = load_data.rename(columns={'test': 'Actual Load'})
-                    elif 'load' in load_data.columns:
-                        load_data = load_data.rename(columns={'load': 'Actual Load'})
-                
-                return load_data if not load_data.empty else pd.DataFrame()
-                
-            except Exception as e:
-                logger.error("Failed to fetch load data using both methods")
+            # Fetch data from API
+            data = self.fetch_load_data(start_date, end_date)
+            
+            if data is None or data.empty:
+                self.logger.warning("No data retrieved")
                 return pd.DataFrame()
             
+            # Log data quality information
+            self.logger.info(f"Retrieved {len(data)} rows of data")
+            nan_actual = data['Actual Load'].isna().sum() if 'Actual Load' in data.columns else 0
+            nan_forecast = data['Forecasted Load'].isna().sum() if 'Forecasted Load' in data.columns else 0
+            
+            self.logger.info(f"Data quality check:")
+            self.logger.info(f"- NaN values in Actual Load: {nan_actual}")
+            self.logger.info(f"- NaN values in Forecasted Load: {nan_forecast}")
+            
+            # Ensure we have the required columns
+            if 'Actual Load' not in data.columns:
+                data['Actual Load'] = np.nan
+            
+            # Attempt to impute missing values
+            if nan_actual > 0:
+                self.logger.info("Imputing missing Actual Load values")
+                if 'Forecasted Load' in data.columns:
+                    data['Actual Load'] = data['Actual Load'].fillna(data['Forecasted Load'])
+                    self.logger.info("Used Forecasted Load to fill missing values")
+                
+                # Interpolate remaining NaN values
+                data['Actual Load'] = data['Actual Load'].interpolate(method='linear').ffill().bfill()
+                remaining_nan = data['Actual Load'].isna().sum()
+                self.logger.info(f"Remaining NaN values after imputation: {remaining_nan}")
+            
+            # Filter to requested time range
+            data = data[start_time:end_time]
+            
+            return data
+            
         except Exception as e:
-            logger.error(f"Error in get_load_data: {str(e)}")
+            self.logger.error(f"Error fetching load data: {str(e)}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
             return pd.DataFrame()
     
                 

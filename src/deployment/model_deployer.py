@@ -72,99 +72,344 @@ class ModelDeployer:
             self.logger.error(f"Error initializing pipeline: {str(e)}")
             return False
     
-    def make_prediction(self, timestamp) -> Optional[pd.Series]:
-        """Make predictions for a given timestamp."""
+    def make_prediction(self, timestamps) -> Optional[pd.DataFrame]:
+        """Make predictions for a list of timestamps with improved feature handling."""
         try:
-            if not isinstance(timestamp, pd.Timestamp):
-                timestamp = pd.Timestamp(timestamp)
+            # Ensure timestamps is a list
+            if not isinstance(timestamps, (list, pd.Index, pd.Series)):
+                timestamps = [timestamps]
             
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.tz_localize('Europe/Berlin')
-            else:
-                timestamp = timestamp.tz_convert('Europe/Berlin')
+            # Convert all timestamps to pd.Timestamp with correct timezone
+            berlin_tz = pytz.timezone('Europe/Berlin')
+            timestamps = [
+                pd.Timestamp(ts).tz_localize(berlin_tz) if ts.tzinfo is None else pd.Timestamp(ts).tz_convert(berlin_tz)
+                for ts in timestamps
+            ]
             
-            # Get data up to the prediction timestamp
+            # Get historical data
             historical_data = self.pipeline.get_historical_data()
             if historical_data is None or historical_data.empty:
                 self.logger.error("No historical data available")
                 return None
             
-            # Extract features using the feature extractor
-            features = self.feature_extractor.extract_features(historical_data)
-            if features is None:
+            # Create prediction DataFrame with timestamps
+            pred_df = pd.DataFrame(index=pd.Index(timestamps))
+            pred_df['Actual Load'] = np.nan  # Initialize with NaN
+            
+            # Combine historical and prediction data
+            combined_df = pd.concat([historical_data, pred_df]).sort_index()
+            combined_df = combined_df[~combined_df.index.duplicated(keep='first')]  # Remove any duplicates
+            
+            # Extract features using LoadFeatureExtractor
+            features = self.feature_extractor.extract_features(combined_df)
+            if features is None or features.empty:
                 self.logger.error("Failed to extract features")
                 return None
             
-            # Get expected features from model
+            # Get features only for prediction timestamps
+            pred_features = features.loc[timestamps]
+            
+            # Get expected features from the model
             expected_features = self._get_model_features()
             if expected_features is None:
                 self.logger.error("Could not determine expected features from model")
                 return None
             
-            # Get the latest available features
-            latest_features = features.iloc[-1:].copy()
-            
-            if latest_features.empty:
-                self.logger.error("No features available for requested timestamps")
+            # Ensure features are aligned with model expectations
+            pred_features = self._align_features(pred_features, expected_features)
+            if pred_features is None:
+                self.logger.error("Failed to align features")
                 return None
             
-            # Make predictions for next 24 hours (96 intervals)
-            predictions = []
-            current_features = latest_features.copy()
-            last_actual_load = latest_features['Actual Load'].iloc[0]
+            # Log feature shapes for debugging
+            self.logger.info(f"Number of timestamps: {len(timestamps)}")
+            self.logger.info(f"Shape of prediction features: {pred_features.shape}")
             
-            for i in range(96):  # 24 hours * 4 (15-min intervals)
-                current_time = timestamp + pd.Timedelta(minutes=15*i)
-                
-                # Update time-based features
-                current_features['hour'] = current_time.hour
-                current_features['weekday'] = current_time.dayofweek
-                current_features['month'] = current_time.month
-                current_features['hour_sin'] = np.sin(2 * np.pi * current_time.hour / 24)
-                current_features['hour_cos'] = np.cos(2 * np.pi * current_time.hour / 24)
-                current_features['weekday_sin'] = np.sin(2 * np.pi * current_time.dayofweek / 7)
-                current_features['weekday_cos'] = np.cos(2 * np.pi * current_time.dayofweek / 7)
-                
-                # Update load-based features
-                if i > 0:
-                    current_features['Actual Load'] = predictions[-1]  # Use last prediction
-                    
-                    if i >= 96:  # After 24 hours
-                        current_features['96_periods_ago_load'] = predictions[i-96]
-                    if i >= 672:  # After 7 days
-                        current_features['672_periods_ago_load'] = predictions[i-672]
-                    
-                    # Update rolling statistics
-                    recent_loads = predictions[-96:] if i >= 96 else predictions + [last_actual_load] * (96-i)
-                    current_features['rolling_mean_24h'] = np.mean(recent_loads)
-                    current_features['rolling_std_24h'] = np.std(recent_loads)
-                    
-                    recent_loads_168h = predictions[-672:] if i >= 672 else predictions + [last_actual_load] * (672-i)
-                    current_features['rolling_mean_168h'] = np.mean(recent_loads_168h)
-                    current_features['rolling_std_168h'] = np.std(recent_loads_168h)
-                
-                # Ensure all expected features are present
-                for feature in expected_features:
-                    if feature not in current_features:
-                        current_features[feature] = 0
-                
-                # Make prediction using only the expected features
-                pred = self.model.predict(current_features[expected_features])[0]
-                predictions.append(pred)
+            # Make predictions
+            predictions = self.model.predict(pred_features)
+            self.logger.info(f"Number of predictions: {len(predictions)}")
             
-            # Create prediction series
-            pred_index = pd.date_range(
-                start=timestamp,
-                periods=96,
-                freq='15min',
-                tz='Europe/Berlin'
-            )
-            return pd.Series(predictions, index=pred_index)
+            # Create predictions series with matching index
+            predictions_series = pd.Series(predictions, index=pred_features.index, name='predicted_load')
             
+            # Add confidence intervals
+            baseline_stats = self._calculate_baseline_stats(historical_data)
+            return self._add_confidence_intervals(predictions_series, baseline_stats)
+        
         except Exception as e:
             self.logger.error(f"Error making prediction: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
             return None
+    
+    def _calculate_baseline_stats(self, historical_data):
+        """Calculate baseline statistics for feature estimation."""
+        try:
+            stats = {
+                'hourly_patterns': {},
+                'daily_patterns': {},
+                'weekly_std': historical_data['Actual Load'].std(),
+                'overall_mean': historical_data['Actual Load'].mean()
+            }
+            
+            # Calculate hourly patterns
+            for hour in range(24):
+                hourly_data = historical_data[historical_data.index.hour == hour]
+                stats['hourly_patterns'][hour] = {
+                    'mean': hourly_data['Actual Load'].mean(),
+                    'std': hourly_data['Actual Load'].std()
+                }
+            
+            # Calculate daily patterns
+            for day in range(7):
+                daily_data = historical_data[historical_data.index.dayofweek == day]
+                stats['daily_patterns'][day] = {
+                    'mean': daily_data['Actual Load'].mean(),
+                    'std': daily_data['Actual Load'].std()
+                }
+            
+            return stats
+        except Exception as e:
+            self.logger.error(f"Error calculating baseline stats: {str(e)}")
+        
+            return None
+                
+    def _create_feature_row(self, timestamp, latest_features, historical_data, baseline_stats, initial_pred=None):
+        """Create a feature row for prediction with improved future handling."""
+        try:
+            feature_row = latest_features.copy()
+            
+            # Basic time features (these are always available)
+            feature_row['hour'] = timestamp.hour
+            feature_row['weekday'] = timestamp.dayofweek
+            feature_row['month'] = timestamp.month
+            feature_row['hour_sin'] = np.sin(2 * np.pi * timestamp.hour / 24)
+            feature_row['hour_cos'] = np.cos(2 * np.pi * timestamp.hour / 24)
+            feature_row['weekday_sin'] = np.sin(2 * np.pi * timestamp.dayofweek / 7)
+            feature_row['weekday_cos'] = np.cos(2 * np.pi * timestamp.dayofweek / 7)
+            
+            # Get holidays and check if day before holiday
+            holidays = self.pipeline.get_holidays()
+            day_before = timestamp - pd.Timedelta(days=1)
+            is_day_before_holiday = 1 if day_before.date() in holidays else 0
+            feature_row['is_day_before_holiday'] = is_day_before_holiday
+
+            # Get the last valid timestamp from historical data
+            last_valid_time = historical_data.index.max()
+            
+            # For future timestamps, use a rolling window of predictions
+            if timestamp > last_valid_time:
+                # Use pattern-based estimation for Actual Load
+                hour_stats = baseline_stats['hourly_patterns'][timestamp.hour]
+                day_stats = baseline_stats['daily_patterns'][timestamp.dayofweek]
+                
+                # Calculate estimated load using patterns
+                estimated_load = (
+                    hour_stats['mean'] * 0.4 +     # Hourly pattern
+                    day_stats['mean'] * 0.3 +      # Daily pattern
+                    historical_data['Actual Load'].tail(96).mean() * 0.2 +  # Recent trend
+                    baseline_stats['overall_mean'] * 0.1  # Overall baseline
+                )
+                
+                # Adjust for time of day and holidays
+                if 8 <= timestamp.hour <= 18:
+                    estimated_load *= 1.1
+                elif 0 <= timestamp.hour <= 5:
+                    estimated_load *= 0.9
+                if is_day_before_holiday:
+                    estimated_load *= 0.95
+                    
+                feature_row['Actual Load'] = estimated_load
+                
+                # Handle lagged features
+                one_day_ago = timestamp - pd.Timedelta(days=1)
+                week_ago = timestamp - pd.Timedelta(days=7)
+                
+                feature_row['96_periods_ago_load'] = self._get_historical_or_estimated_load(
+                    one_day_ago, historical_data, baseline_stats
+                )
+                feature_row['672_periods_ago_load'] = self._get_historical_or_estimated_load(
+                    week_ago, historical_data, baseline_stats
+                )
+                
+                # Calculate rolling statistics using available data and estimates
+                feature_row['rolling_mean_24h'] = self._estimate_rolling_mean(
+                    timestamp, historical_data, baseline_stats, hours=24
+                )
+                feature_row['rolling_mean_168h'] = self._estimate_rolling_mean(
+                    timestamp, historical_data, baseline_stats, hours=168
+                )
+                feature_row['rolling_std_24h'] = hour_stats['std']
+                feature_row['rolling_std_168h'] = baseline_stats['weekly_std']
+            else:
+                # For historical timestamps, use actual values where available
+                feature_row['Actual Load'] = historical_data.loc[timestamp, 'Actual Load']
+                feature_row['96_periods_ago_load'] = historical_data.loc[
+                    timestamp - pd.Timedelta(days=1), 'Actual Load'
+                ]
+                feature_row['672_periods_ago_load'] = historical_data.loc[
+                    timestamp - pd.Timedelta(days=7), 'Actual Load'
+                ]
+                # Calculate rolling statistics from historical data
+                past_24h = historical_data.loc[:timestamp].last('24H')['Actual Load']
+                past_168h = historical_data.loc[:timestamp].last('168H')['Actual Load']
+                
+                feature_row['rolling_mean_24h'] = past_24h.mean()
+                feature_row['rolling_mean_168h'] = past_168h.mean()
+                feature_row['rolling_std_24h'] = past_24h.std()
+                feature_row['rolling_std_168h'] = past_168h.std()
+            
+            # Check for any remaining NaN values and fill with pattern-based estimates
+            for col in feature_row.columns:
+                if pd.isna(feature_row[col].iloc[0]):
+                    if col in ['rolling_mean_24h', 'rolling_mean_168h']:
+                        feature_row[col] = baseline_stats['overall_mean']
+                    elif col in ['rolling_std_24h', 'rolling_std_168h']:
+                        feature_row[col] = baseline_stats['weekly_std']
+                    elif col in ['96_periods_ago_load', '672_periods_ago_load']:
+                        feature_row[col] = baseline_stats['hourly_patterns'][timestamp.hour]['mean']
+            
+            return feature_row
+            
+        except Exception as e:
+            self.logger.error(f"Error creating feature row for {timestamp}: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return None
+    
+    def _get_historical_or_estimated_load(self, timestamp, historical_data, baseline_stats):
+        """Get historical load if available, otherwise estimate it."""
+        try:
+            # Check if timestamp exists in historical data and has a valid value
+            if timestamp in historical_data.index and not pd.isna(historical_data.loc[timestamp, 'Actual Load']):
+                return historical_data.loc[timestamp, 'Actual Load']
+            
+            # If data is missing, use a more sophisticated estimation approach
+            hour_stats = baseline_stats['hourly_patterns'][timestamp.hour]
+            day_stats = baseline_stats['daily_patterns'][timestamp.dayofweek]
+            
+            # Try to get the most recent valid load value
+            recent_loads = historical_data['Actual Load'].dropna()
+            recent_mean = recent_loads.tail(96).mean() if not recent_loads.empty else baseline_stats['overall_mean']
+            
+            # Combine different signals for estimation
+            estimated_load = (
+                hour_stats['mean'] * 0.4 +     # Hourly pattern
+                day_stats['mean'] * 0.3 +      # Daily pattern
+                recent_mean * 0.2 +            # Recent trend
+                baseline_stats['overall_mean'] * 0.1  # Overall baseline
+            )
+            
+            # Adjust for time of day
+            if 8 <= timestamp.hour <= 18:  # Peak hours
+                estimated_load *= 1.1
+            elif 0 <= timestamp.hour <= 5:  # Night hours
+                estimated_load *= 0.9
+            
+            # Check if the estimation seems reasonable
+            if estimated_load < 0:
+                self.logger.warning(f"Negative load estimation for {timestamp}, using fallback")
+                estimated_load = baseline_stats['overall_mean']
+            
+            if timestamp not in historical_data.index:
+                self.logger.debug(
+                    f"Estimated load for {timestamp}: {estimated_load:.2f} MW "
+                    f"(hour_mean: {hour_stats['mean']:.2f}, day_mean: {day_stats['mean']:.2f}, "
+                    f"recent_mean: {recent_mean:.2f}, overall_mean: {baseline_stats['overall_mean']:.2f})"
+                )
+            
+            return estimated_load
+        
+        except Exception as e:
+            self.logger.error(f"Error in _get_historical_or_estimated_load for {timestamp}: {str(e)}")
+            # Fallback to overall mean if everything else fails
+            return baseline_stats['overall_mean']
+    
+    def _estimate_rolling_mean(self, timestamp, historical_data, baseline_stats, hours):
+        """Estimate rolling mean using available data and patterns with improved handling."""
+        try:
+            # For 168h mean, use a combination of available data and patterns if we don't have full history
+            if hours == 168:  # 7 days
+                # Get available historical data up to the timestamp
+                available_data = historical_data[historical_data.index <= timestamp]['Actual Load']
+                if len(available_data) >= 24 * 4:  # At least 24 hours of data
+                    # Use a weighted combination of available data mean and pattern-based estimation
+                    recent_mean = available_data.mean()
+                    day_stats = baseline_stats['daily_patterns'][timestamp.dayofweek]
+                    hour_stats = baseline_stats['hourly_patterns'][timestamp.hour]
+                    
+                    weighted_mean = (
+                        recent_mean * 0.4 +                    # Recent data
+                        day_stats['mean'] * 0.3 +             # Day of week pattern
+                        hour_stats['mean'] * 0.2 +            # Hour of day pattern
+                        baseline_stats['overall_mean'] * 0.1   # Overall pattern
+                    )
+                    return weighted_mean
+                else:
+                    # If we have very limited data, use pattern-based estimation
+                    return (
+                        baseline_stats['daily_patterns'][timestamp.dayofweek]['mean'] * 0.5 +
+                        baseline_stats['hourly_patterns'][timestamp.hour]['mean'] * 0.3 +
+                        baseline_stats['overall_mean'] * 0.2
+                    )
+            
+            # For shorter windows (e.g., 24h), use the original logic with improvements
+            relevant_times = pd.date_range(
+                end=timestamp,
+                periods=hours * 4,  # 15-minute intervals
+                freq='15min'
+            )
+            
+            values = []
+            weights = []
+            
+            for ts in relevant_times:
+                if ts in historical_data.index and not pd.isna(historical_data.loc[ts, 'Actual Load']):
+                    # Actual historical value
+                    values.append(historical_data.loc[ts, 'Actual Load'])
+                    weights.append(1.0)  # Full weight for actual values
+                else:
+                    # Estimate missing values
+                    hour_stats = baseline_stats['hourly_patterns'][ts.hour]
+                    day_stats = baseline_stats['daily_patterns'][ts.dayofweek]
+                    
+                    estimated = (
+                        hour_stats['mean'] * 0.4 +
+                        day_stats['mean'] * 0.4 +
+                        baseline_stats['overall_mean'] * 0.2
+                    )
+                    values.append(estimated)
+                    weights.append(0.7)  # Lower weight for estimated values
+            
+            if not values:
+                return baseline_stats['overall_mean']
+            
+            # Apply exponential decay to weights
+            decay_factor = np.exp(-np.arange(len(values)) / (len(values) / 2))
+            final_weights = np.array(weights) * decay_factor
+            
+            # Calculate weighted average
+            weighted_mean = np.average(values, weights=final_weights)
+            
+            return weighted_mean
+            
+        except Exception as e:
+            self.logger.error(f"Error in _estimate_rolling_mean for {timestamp}: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return baseline_stats['overall_mean']
+    
+    def _add_confidence_intervals(self, predictions, baseline_stats):
+        predictions_df = predictions.to_frame('predicted_load')
+        
+        # Calculate confidence intervals based on hourly patterns
+        predictions_df['lower_bound'] = predictions_df['predicted_load']
+        predictions_df['upper_bound'] = predictions_df['predicted_load']
+        
+        for idx in predictions_df.index:
+            hour = idx.hour
+            hour_std = baseline_stats['hourly_patterns'][hour]['std']
+            predictions_df.loc[idx, 'lower_bound'] = predictions_df.loc[idx, 'predicted_load'] - 2 * hour_std
+            predictions_df.loc[idx, 'upper_bound'] = predictions_df.loc[idx, 'predicted_load'] + 2 * hour_std
+        
+        return predictions_df
     
     def _get_model_features(self):
         """Get feature names from the model."""
@@ -199,11 +444,17 @@ class ModelDeployer:
             
         except Exception as e:
             self.logger.warning(f"Error getting model features: {str(e)}")
-            return None
+        return None
 
     def _align_features(self, features_df, expected_features):
         """Align features to match what the model expects."""
         try:
+            # Ensure features_df is a DataFrame
+            if isinstance(features_df, pd.Series):
+                features_df = features_df.to_frame().T
+            elif not isinstance(features_df, pd.DataFrame):
+                raise ValueError(f"Expected a DataFrame or Series, got {type(features_df)}")
+            
             # Create a copy to avoid modifying the original
             aligned_df = features_df.copy()
             
@@ -212,7 +463,7 @@ class ModelDeployer:
                 if feature not in aligned_df.columns:
                     if feature == 'Forecasted Load':
                         # Use mean of actual load as default forecast
-                        aligned_df[feature] = aligned_df['load_1h_ago']
+                        aligned_df[feature] = aligned_df.get('load_1h_ago', aligned_df['Actual Load'])
                     else:
                         aligned_df[feature] = 0
             
