@@ -1,0 +1,10 @@
+Real-time Prediction Performance Metrics
+=====================================
+
+mae: 1957.15
+rmse: 1957.15
+mape: 4.46
+max_error: 1957.15
+min_error: 1957.15
+std_error: 0.00
+interval_coverage: 100.00

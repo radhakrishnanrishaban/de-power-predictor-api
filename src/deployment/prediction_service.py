@@ -12,6 +12,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from src.deployment.model_deployer import ModelDeployer
 from src.data.utils.metrics import MetricsCollector
+from src.model.feature_extractor import LoadFeatureExtractor
+from src.data.clients.entsoe_client import EntsoeClient
 
 class PredictionService:
     """Service for generating load predictions."""
@@ -23,6 +25,8 @@ class PredictionService:
         self.initialized = False
         self.predictions_cache = pd.DataFrame()
         self.metrics_collector = MetricsCollector()
+        self.feature_extractor = LoadFeatureExtractor()
+        self.entsoe_client = EntsoeClient()
         
     def initialize(self):
         """Initialize the service."""
@@ -80,54 +84,48 @@ class PredictionService:
             self.logger.error(f"Error in get_prediction: {str(e)}")
             return None
     
-    def get_forecast(self, hours=24, now=None):
-        """Get load forecast with improved historical overlap and timestamp handling."""
+    def get_forecast(self, hours: int = 24, start_time: Optional[datetime] = None) -> pd.DataFrame:
+        """Get load forecast with proper feature handling."""
         try:
-            if now is None:
-                now = datetime.now(pytz.timezone('Europe/Berlin'))
+            if start_time is None:
+                start_time = datetime.now(pytz.timezone('Europe/Berlin'))
             
-            # Get historical data
-            historical_data = self.deployer.pipeline.get_historical_data()
-            if historical_data is None:
-                self.logger.error("No historical data available for forecasting")
-                return None
+            # Get historical data for feature creation
+            historical_end = start_time
+            historical_start = historical_end - timedelta(days=7)  # Get 1 week of history
             
-            # Find the last valid timestamp in historical data
-            last_valid_time = historical_data['Actual Load'].dropna().index.max()
-            self.logger.info(f"Last valid timestamp in historical data: {last_valid_time}")
+            historical_data = self.entsoe_client.get_load_data(historical_start, historical_end)
             
-            # Extend historical overlap to 24 hours
-            historical_overlap = pd.date_range(
-                start=max(now - pd.Timedelta(hours=24), last_valid_time - pd.Timedelta(hours=24)),
-                end=last_valid_time,
-                freq='15min'
+            if historical_data.empty:
+                self.logger.error("No historical data available")
+                return pd.DataFrame()
+            
+            # Create prediction timestamps
+            pred_index = pd.date_range(
+                start=start_time,
+                periods=hours * 4,  # 15-minute intervals
+                freq='15min',
+                tz='Europe/Berlin'
             )
             
-            # Generate future timestamps
-            forecast_timestamps = pd.date_range(
-                start=now, 
-                periods=hours*4, 
-                freq='15min'
+            # Prepare data for feature extraction
+            pred_data = pd.DataFrame(index=pred_index)
+            if 'Actual Load' in historical_data.columns:
+                pred_data['Actual Load'] = historical_data['Actual Load']
+            
+            # Extract features
+            features = self.feature_extractor.extract_features(
+                data=pred_data,
+                historical_data=historical_data
             )
             
-            # Combine timestamps and ensure timezone
-            timestamps = historical_overlap.union(forecast_timestamps)
-            if timestamps.tz is None:
-                timestamps = timestamps.tz_localize('Europe/Berlin')
-            
-            # Get predictions
-            predictions = self.deployer.make_prediction(timestamps)
-            if predictions is None:
-                self.logger.error("Failed to generate predictions")
-                return None
-            
-            self.logger.info(f"Generated predictions from {predictions.index.min()} to {predictions.index.max()}")
-            self.logger.info(f"Final forecast has {len(predictions)} points")
+            # Make predictions
+            predictions = self.deployer.make_prediction(features)
             
             return predictions
-        
+            
         except Exception as e:
-            self.logger.error(f"Error in get_forecast: {str(e)}")
+            self.logger.error(f"Error getting forecast: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
-            return None
-     
+            return pd.DataFrame()
+    

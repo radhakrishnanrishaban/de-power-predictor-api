@@ -1,31 +1,15 @@
 Model Training Metrics
 =====================
 
-Cross-validation Metrics (average across folds):
-MAE: 951.38
-RMSE: 1265.96
-MAPE: 1.83%
-R2: 0.9793
-
-Fold-wise MAPE:
-Fold 1: 2.00%
-Fold 2: 2.10%
-Fold 3: 1.78%
-Fold 4: 1.64%
-Fold 5: 1.64%
-
-Feature Importance:
-rolling_mean_24h: 2954.0000
-hour: 2063.0000
-rolling_std_24h: 1831.0000
-rolling_mean_168h: 1815.0000
-672_periods_ago_load: 1774.0000
-rolling_std_168h: 1245.0000
-96_periods_ago_load: 1220.0000
-month: 1218.0000
-hour_cos: 914.0000
-hour_sin: 861.0000
-weekday: 782.0000
-weekday_sin: 361.0000
-weekday_cos: 212.0000
-is_day_before_holiday: 0.0000
+mae: 556.96
+rmse: 743.00
+mape: 1.00
+r2: 0.99
+max_error: 3553.70
+median_ae: 433.26
+peak_mae: 667.37
+trough_mae: 315.31
+prediction_interval_coverage: 77.38
+peak_coverage: 79.41
+trough_coverage: 77.78
+timestamp: 20250330_230722

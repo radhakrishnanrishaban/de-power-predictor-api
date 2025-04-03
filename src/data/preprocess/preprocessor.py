@@ -154,67 +154,106 @@ class LoadDataPreprocessor:
         return df
     
     def _remove_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
-        logger.info("Removing outliers")
+        """Enhanced outlier detection using multiple methods."""
+        logger.info("Removing outliers with enhanced detection")
         df = df.copy()
 
-        # Ensure no NaNs cause issues: interpolate/fill missing values first
-        df['Actual Load'] = (
-            df['Actual Load']
-            .interpolate(method='linear')
-            .bfill()
-            .ffill()
-        )
-
-        # Iterate until no outliers remain or a max iteration count is reached
-        max_iter = 5
-        for _ in range(max_iter):
+        # 1. Calculate multiple rolling statistics
+        windows = [24, 48, 96, 168]  # 6h, 12h, 24h, 1week in 15-min intervals
+        outlier_masks = []
+        
+        for window in windows:
+            # Calculate rolling stats
             rolling_mean = df['Actual Load'].rolling(
-                window=self.rolling_window,
+                window=window,
                 center=True,
-                min_periods=max(3, self.rolling_window // 4)
-            ).mean().fillna(df['Actual Load'].mean())
+                min_periods=max(3, window // 4)
+            ).mean()
             
             rolling_std = df['Actual Load'].rolling(
-                window=self.rolling_window,
+                window=window,
                 center=True,
-                min_periods=max(3, self.rolling_window // 4)
-            ).std().fillna(df['Actual Load'].std())
-            # Replace zeros in std to avoid division by zero:
-            rolling_std = rolling_std.replace(0, df['Actual Load'].std())
+                min_periods=max(3, window // 4)
+            ).std()
             
+            # Calculate z-scores for this window
             z_scores = abs((df['Actual Load'] - rolling_mean) / rolling_std)
-            outlier_mask = z_scores > self.zscore_threshold
-            n_outliers = outlier_mask.sum()
-            if n_outliers == 0:
-                break
+            outlier_masks.append(z_scores > self.zscore_threshold)
+        
+        # 2. Add day-of-week pattern detection
+        dow_means = df.groupby([df.index.dayofweek, df.index.hour])['Actual Load'].transform('mean')
+        dow_stds = df.groupby([df.index.dayofweek, df.index.hour])['Actual Load'].transform('std')
+        dow_z_scores = abs((df['Actual Load'] - dow_means) / dow_stds)
+        outlier_masks.append(dow_z_scores > self.zscore_threshold)
+        
+        # Combine outlier masks (point must be flagged by at least 2 methods)
+        final_outlier_mask = sum(outlier_masks) >= 2
+        n_outliers = final_outlier_mask.sum()
+        
+        if n_outliers > 0:
             logger.warning(f"Found {n_outliers} outliers")
-            # Replace outliers with rolling median for robustness
-            rolling_median = df['Actual Load'].rolling(
-                window=self.rolling_window,
-                center=True,
-                min_periods=max(3, self.rolling_window // 4)
-            ).median()
-            df.loc[outlier_mask, 'Actual Load'] = rolling_median[outlier_mask]
-            logger.info(f"Replaced {n_outliers} outliers with rolling median")
+            
+            # Replace outliers with pattern-based estimates
+            for idx in df[final_outlier_mask].index:
+                # Get pattern-based estimate
+                hour_pattern = df.groupby(df.index.hour)['Actual Load'].mean()[idx.hour]
+                dow_pattern = df.groupby(df.index.dayofweek)['Actual Load'].mean()[idx.dayofweek]
+                recent_mean = df['Actual Load'].rolling(window=96, center=True).mean()[idx]
+                
+                # Weighted combination
+                df.loc[idx, 'Actual Load'] = (
+                    hour_pattern * 0.4 +
+                    dow_pattern * 0.3 +
+                    recent_mean * 0.3
+                )
+            
+            logger.info(f"Replaced {n_outliers} outliers with pattern-based estimates")
+        
         return df
-
     
     def _handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle missing values using interpolation."""
-        logger.info("Handling missing values")
+        """Enhanced missing value handling with pattern-based filling."""
+        logger.info("Handling missing values with pattern-based approach")
         
         initial_missing = df['Actual Load'].isna().sum()
         if initial_missing > 0:
             logger.warning(f"Found {initial_missing} missing values")
             
-            # Forward fill with limit
-            df['Actual Load'] = df['Actual Load'].ffill(limit=4)  # 1 hour limit
+            df = df.copy()
+            missing_mask = df['Actual Load'].isna()
             
-            # Linear interpolation for remaining gaps
-            df['Actual Load'] = df['Actual Load'].interpolate(method='linear')
+            # 1. Try to fill with same hour from previous day
+            for idx in df[missing_mask].index:
+                day_ago = idx - pd.Timedelta(days=1)
+                if day_ago in df.index and not pd.isna(df.loc[day_ago, 'Actual Load']):
+                    df.loc[idx, 'Actual Load'] = df.loc[day_ago, 'Actual Load']
+            
+            # 2. Fill remaining with pattern-based estimates
+            still_missing = df['Actual Load'].isna()
+            if still_missing.any():
+                # Calculate patterns
+                hour_patterns = df.groupby(df.index.hour)['Actual Load'].mean()
+                dow_patterns = df.groupby(df.index.dayofweek)['Actual Load'].mean()
+                
+                for idx in df[still_missing].index:
+                    hour_val = hour_patterns[idx.hour]
+                    dow_val = dow_patterns[idx.dayofweek]
+                    overall_mean = df['Actual Load'].mean()
+                    
+                    df.loc[idx, 'Actual Load'] = (
+                        hour_val * 0.5 +
+                        dow_val * 0.3 +
+                        overall_mean * 0.2
+                    )
+            
+            # 3. Final interpolation for any remaining gaps
+            df['Actual Load'] = df['Actual Load'].interpolate(method='time', limit=4)
             
             final_missing = df['Actual Load'].isna().sum()
             logger.info(f"Resolved {initial_missing - final_missing} missing values")
+            
+            if final_missing > 0:
+                logger.warning(f"Unable to resolve {final_missing} missing values")
         
         return df
     

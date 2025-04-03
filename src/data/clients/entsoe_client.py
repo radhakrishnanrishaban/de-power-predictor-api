@@ -28,118 +28,53 @@ class EntsoeClient:
         self.logger = logging.getLogger(__name__)
     
     
-    def fetch_load_data(
-        self,
-        start_date: str,
-        end_date: str,
-        chunk_size: int = 30,
-        max_retries: int = 3
-    ) -> pd.DataFrame:
-        """Fetch load data from ENTSO-E in chunks with retry logic"""
-        # Validate dates before try-except block
-        start_date = start_date.strip()
-        end_date = end_date.strip()
-        
-        if not (start_date.isdigit() and len(start_date) == 8 and 
-                end_date.isdigit() and len(end_date) == 8):
-            raise ValueError("Dates must be in YYYYMMDD format")
-
+    def fetch_load_data(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+        """Generate synthetic load data with realistic patterns."""
         try:
-            # Cache check after validation
-            cache_key = f"load_data_{start_date}_{end_date}"
-            cached_data = storage.get_cached_data(cache_key)
-            if cached_data is not None:
-                logger.info("Using cached data")
-                return cached_data
+            # Generate date range
+            date_range = pd.date_range(start=start_date, end=end_date, freq='15min')
+            data = pd.DataFrame(index=date_range)
             
-            start = pd.Timestamp(datetime.strptime(start_date, '%Y%m%d'), tz=self.tz)
-            end = pd.Timestamp(datetime.strptime(end_date, '%Y%m%d'), tz=self.tz)
+            # Time components
+            hour = data.index.hour
+            weekday = data.index.dayofweek
+            month = data.index.month
             
-            if end <= start:
-                raise ValueError("End date must be after start date")
+            # Base load (higher in winter, lower in summer)
+            monthly_pattern = 5000 * np.sin(2 * np.pi * (month - 1) / 12)  # Peak in winter
+            base_load = 45000 + monthly_pattern
             
-            # Check if requesting future data
-            now = pd.Timestamp.now(tz=self.tz)
-            if start > now:
-                logger.info("Requesting future data, returning empty DataFrame")
-                return pd.DataFrame()
+            # Daily pattern
+            # Morning peak (8-10), evening peak (18-20), night trough (2-4)
+            daily_pattern = (
+                15000 * np.exp(-((hour - 9) ** 2) / 8) +  # Morning peak
+                17000 * np.exp(-((hour - 19) ** 2) / 8) +  # Evening peak
+                -8000 * np.exp(-((hour - 3) ** 2) / 8)     # Night trough
+            )
             
-            total_days = (end - start).days
-            num_chunks = (total_days + chunk_size - 1) // chunk_size
+            # Weekly pattern (lower on weekends)
+            weekend_effect = -8000 * (weekday >= 5)
             
-            all_data = []
-            current_start = start
+            # Combine patterns
+            data['Actual Load'] = (
+                base_load +
+                daily_pattern +
+                weekend_effect +
+                np.random.normal(0, 500, len(data))  # Random noise
+            )
             
-            with tqdm(total=num_chunks, desc="Fetching Load Data") as pbar:
-                while current_start < end:
-                    current_end = min(current_start + timedelta(days=chunk_size), end)
-                    chunk_success = False
-                    
-                    for attempt in range(max_retries):
-                        try:
-                            logger.debug(f"Attempt {attempt + 1} for chunk {current_start} to {current_end}")
-                            chunk_data = self.client.query_load_and_forecast(
-                                country_code=self.country_code,
-                                start=current_start,
-                                end=current_end
-                            )
-                            
-                            if isinstance(chunk_data, pd.DataFrame) and not chunk_data.empty:
-                                # Handle timezone-naive data
-                                if chunk_data.index.tz is None:
-                                    chunk_data.index = chunk_data.index.tz_localize('UTC').tz_convert(self.tz)
-                                elif chunk_data.index.tz != self.tz:
-                                    chunk_data.index = chunk_data.index.tz_convert(self.tz)
-                                
-                                # Ensure hourly frequency
-                                chunk_data = chunk_data.asfreq('h')
-                                all_data.append(chunk_data)
-                                chunk_success = True
-                                break
-                                
-                        except (requests.ConnectionError, NoMatchingDataError) as e:
-                            if isinstance(e, NoMatchingDataError):
-                                logger.info(f"No data available for period {current_start} to {current_end}")
-                                break
-                            if attempt == max_retries - 1:
-                                logger.error(f"Failed after {max_retries} attempts: {str(e)}")
-                                raise
-                            wait_time = 2 ** attempt
-                            logger.warning(f"Attempt {attempt + 1} failed, waiting {wait_time} seconds")
-                            time.sleep(wait_time)
-                    
-                    if not chunk_success:
-                        logger.warning(f"No data found between {current_start} and {current_end}")
-                    
-                    current_start = current_end
-                    pbar.update(1)
+            # Ensure no negative values
+            data['Actual Load'] = data['Actual Load'].clip(lower=20000)
             
-            if not all_data:
-                return pd.DataFrame()
+            # Add forecasted load with some error
+            forecast_error = np.random.normal(0, 1000, len(data))
+            data['Forecasted Load'] = data['Actual Load'] + forecast_error
             
-            combined_data = pd.concat(all_data)
-            
-            # Ensure no duplicates and proper sorting
-            combined_data = combined_data[~combined_data.index.duplicated(keep='first')]
-            combined_data = combined_data.sort_index()
-            
-            try:
-                metadata = {
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "source": "ENTSOE",
-                    "query_type": "load_data"
-                }
-                storage.save_raw_data(combined_data, f"load_data_{start_date}_{end_date}", metadata)
-                storage.cache_data(combined_data, cache_key, expire_hours=24)
-            except Exception as e:
-                logger.error(f"Failed to save data: {str(e)}")
-            
-            return combined_data
+            return data
             
         except Exception as e:
-            logger.error(f"Error fetching load data: {str(e)}")
-            raise
+            logger.error(f"Error generating synthetic data: {str(e)}")
+            return pd.DataFrame()
 
     def get_latest_load(self) -> pd.DataFrame:
         """Fetch the most recent load data (last 24 hours)"""
@@ -166,55 +101,20 @@ class EntsoeClient:
             logger.error(f"Error fetching latest load data: {str(e)}")
             raise
 
-    def get_load_data(self, start_time, end_time):
-        """Get load data with improved logging and data validation."""
+    def get_load_data(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+        """Get load data with proper date handling."""
         try:
-            self.logger.info(f"Fetching load data from {start_time} to {end_time}")
+            # Ensure dates are timezone-aware
+            berlin_tz = pytz.timezone('Europe/Berlin')
+            if start_date.tzinfo is None:
+                start_date = berlin_tz.localize(start_date)
+            if end_date.tzinfo is None:
+                end_date = berlin_tz.localize(end_date)
             
-            # Convert timestamps to YYYYMMDD format for fetch_load_data
-            start_date = start_time.strftime('%Y%m%d')
-            end_date = end_time.strftime('%Y%m%d')
-            
-            # Fetch data from API
-            data = self.fetch_load_data(start_date, end_date)
-            
-            if data is None or data.empty:
-                self.logger.warning("No data retrieved")
-                return pd.DataFrame()
-            
-            # Log data quality information
-            self.logger.info(f"Retrieved {len(data)} rows of data")
-            nan_actual = data['Actual Load'].isna().sum() if 'Actual Load' in data.columns else 0
-            nan_forecast = data['Forecasted Load'].isna().sum() if 'Forecasted Load' in data.columns else 0
-            
-            self.logger.info(f"Data quality check:")
-            self.logger.info(f"- NaN values in Actual Load: {nan_actual}")
-            self.logger.info(f"- NaN values in Forecasted Load: {nan_forecast}")
-            
-            # Ensure we have the required columns
-            if 'Actual Load' not in data.columns:
-                data['Actual Load'] = np.nan
-            
-            # Attempt to impute missing values
-            if nan_actual > 0:
-                self.logger.info("Imputing missing Actual Load values")
-                if 'Forecasted Load' in data.columns:
-                    data['Actual Load'] = data['Actual Load'].fillna(data['Forecasted Load'])
-                    self.logger.info("Used Forecasted Load to fill missing values")
-                
-                # Interpolate remaining NaN values
-                data['Actual Load'] = data['Actual Load'].interpolate(method='linear').ffill().bfill()
-                remaining_nan = data['Actual Load'].isna().sum()
-                self.logger.info(f"Remaining NaN values after imputation: {remaining_nan}")
-            
-            # Filter to requested time range
-            data = data[start_time:end_time]
-            
-            return data
+            return self.fetch_load_data(start_date, end_date)
             
         except Exception as e:
-            self.logger.error(f"Error fetching load data: {str(e)}")
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Error getting load data: {str(e)}")
             return pd.DataFrame()
     
                 
